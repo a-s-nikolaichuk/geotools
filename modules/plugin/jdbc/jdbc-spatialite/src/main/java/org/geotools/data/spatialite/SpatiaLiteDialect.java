@@ -54,6 +54,34 @@ public class SpatiaLiteDialect extends BasicSQLDialect {
 
     public static String SPATIALITE_SPATIAL_INDEX = "org.geotools.data.spatialite.spatialIndex";
 
+    private static final String[] SPATIALITE_SYSTEM_TABLE_NAMES = {
+            "geom_cols_ref_sys",
+            "geometry_columns",
+            "geometry_columns_auth",
+            "geometry_columns_field_infos",
+            "geometry_columns_statistics",
+            "geometry_columns_time",
+            "layer_statistics",
+            "spatial_ref_sys",
+            "spatialite_history",
+            "sql_statements_log",
+            "sqlite_master",
+            "sqlite_sequence",
+            "vector_layers",
+            "vector_layers_auth",
+            "vector_layers_field_infos",
+            "vector_layers_statistics",
+            "views_geometry_columns",
+            "views_geometry_columns_auth",
+            "views_geometry_columns_field_infos",
+            "views_geometry_columns_statistics",
+            "views_layer_statistics",
+            "virts_geometry_columns",
+            "virts_geometry_columns_auth",
+            "virts_geometry_columns_field_infos",
+            "views_geometry_columns_statistics"
+    };
+
     public SpatiaLiteDialect(JDBCDataStore dataStore) {
         super(dataStore);
     }
@@ -125,88 +153,23 @@ public class SpatiaLiteDialect extends BasicSQLDialect {
     }
 
     @Override
-    public boolean includeTable(String schemaName, String tableName, Connection cx)
-            throws SQLException {
-        if ("spatial_ref_sys".equalsIgnoreCase(tableName)) {
-            return false;
+    public boolean includeTable(String schemaName, String tableName, Connection cx) throws SQLException {
+        for (String spatialiteSystemTableName : SPATIALITE_SYSTEM_TABLE_NAMES) {
+            if (spatialiteSystemTableName.equalsIgnoreCase(tableName))
+                return false;
         }
-        if ("geometry_columns".equalsIgnoreCase(tableName)) {
-            return false;
-        }
-        if ("geom_cols_ref_sys".equalsIgnoreCase(tableName)) {
-            return false;
-        }
-        if ("views_geometry_columns".equalsIgnoreCase(tableName)) {
-            return false;
-        }
-        if ("virts_geometry_columns".equalsIgnoreCase(tableName)) {
-            return false;
-        }
-        if ("geometry_columns_auth".equalsIgnoreCase(tableName)) {
-            return false;
-        }
+
         return true;
     }
 
     @Override
     public Class<?> getMapping(ResultSet columnMetaData, Connection cx) throws SQLException {
-        // the sqlite jdbc driver maps geometry type to varchar, so do a lookup
-        // in the geometry_columns table
-        String tbl = columnMetaData.getString("TABLE_NAME");
-        String col = columnMetaData.getString("COLUMN_NAME");
+        // There were breaking changes in SpatiaLite API v.4.0.0, so handling two cases.
+        int spatiaLiteMajorVersion = getSpatiaLiteMajorVersion(cx);
 
-        String sql =
-                "SELECT type FROM geometry_columns "
-                        + "WHERE f_table_name = '"
-                        + tbl
-                        + "' "
-                        + "AND f_geometry_column = '"
-                        + col
-                        + "'";
-        LOGGER.fine(sql);
-
-        Statement st = cx.createStatement();
-        try {
-            ResultSet rs = st.executeQuery(sql);
-            try {
-                if (rs.next()) {
-                    String type = rs.getString("type");
-                    return Geometries.getForName(type).getBinding();
-                }
-            } finally {
-                dataStore.closeSafe(rs);
-            }
-
-            // check geometry columns views
-            sql =
-                    "SELECT b.type FROM views_geometry_columns a, geometry_columns b "
-                            + "WHERE a.f_table_name = b.f_table_name "
-                            + "AND a.f_geometry_column = b.f_geometry_column "
-                            + "AND a.view_name = '"
-                            + tbl
-                            + "' "
-                            + "AND a.view_geometry = '"
-                            + col
-                            + "'";
-            LOGGER.fine(sql);
-            try {
-                rs = st.executeQuery(sql);
-                try {
-                    if (rs.next()) {
-                        String type = rs.getString("type");
-                        return Geometries.getForName(type).getBinding();
-                    }
-                } finally {
-                    dataStore.closeSafe(rs);
-                }
-            } catch (SQLException e) {
-                LOGGER.log(Level.FINEST, "error querying views_geometry_columns", e);
-            }
-        } finally {
-            dataStore.closeSafe(st);
-        }
-
-        return null;
+        return (spatiaLiteMajorVersion < 4)
+                ? getMappingSpatialiteV3(columnMetaData, cx)
+                : getMappingSpatialiteV4(columnMetaData, cx);
     }
 
     @Override
@@ -540,5 +503,171 @@ public class SpatiaLiteDialect extends BasicSQLDialect {
     @Override
     public FilterToSQL createFilterToSQL() {
         return new SpatiaLiteFilterToSQL();
+    }
+
+    private int getSpatiaLiteMajorVersion(Connection cx) throws SQLException {
+        String sql = "PRAGMA table_info('geometry_columns');";
+
+        LOGGER.fine(sql);
+
+        Statement st = cx.createStatement();
+        try {
+            ResultSet rs = st.executeQuery(sql);
+            try {
+                while (rs.next()) {
+                    String columnName = rs.getString("name");
+                    String columnType = rs.getString("type");
+
+                    if ("geometry_type".equalsIgnoreCase(columnName) && "INTEGER".equalsIgnoreCase(columnType))
+                        return 4;
+
+                    if ("type".equalsIgnoreCase(columnName) && "TEXT".equalsIgnoreCase(columnType))
+                        return 3;
+                }
+            } finally {
+                dataStore.closeSafe(rs);
+            }
+        } finally {
+            dataStore.closeSafe(st);
+        }
+
+        return -1;
+    }
+
+    private Class<?> getMappingSpatialiteV3(ResultSet columnMetaData, Connection cx) throws SQLException {
+        //the sqlite jdbc driver maps geometry type to varchar, so do a lookup
+        // in the geometry_columns table
+        String tbl = columnMetaData.getString( "TABLE_NAME");
+        String col = columnMetaData.getString( "COLUMN_NAME");
+
+        String sql = "SELECT type FROM geometry_columns " +
+                "WHERE f_table_name = '" + tbl + "' " +
+                "AND f_geometry_column = '" + col + "'";
+        LOGGER.fine( sql );
+
+        Statement st = cx.createStatement();
+        try {
+            ResultSet rs = st.executeQuery( sql );
+            try {
+                if ( rs.next() ) {
+                    String type = rs.getString( "type" );
+                    return Geometries.getForName( type ).getBinding();
+                }
+            }
+            finally {
+                dataStore.closeSafe( rs );
+            }
+
+            // check geometry columns views
+            sql = "SELECT b.type FROM views_geometry_columns a, geometry_columns b " +
+                    "WHERE a.f_table_name = b.f_table_name " +
+                    "AND a.f_geometry_column = b.f_geometry_column " +
+                    "AND a.view_name = '" + tbl + "' " +
+                    "AND a.view_geometry = '" + col + "'";
+            LOGGER.fine( sql );
+            try {
+                rs = st.executeQuery(sql);
+                try {
+                    if (rs.next()) {
+                        String type = rs.getString( "type" );
+                        return Geometries.getForName( type ).getBinding();
+                    }
+                }
+                finally {
+                    dataStore.closeSafe(rs);
+                }
+            }
+            catch(SQLException e) {
+                LOGGER.log(Level.FINEST, "error querying views_geometry_columns", e);
+            }
+        }
+        finally {
+            dataStore.closeSafe( st );
+        }
+
+        return null;
+    }
+
+    private Class<?> getMappingSpatialiteV4(ResultSet columnMetaData, Connection cx) throws SQLException {
+        //the sqlite jdbc driver maps geometry type to varchar, so do a lookup
+        // in the geometry_columns table
+        String tbl = columnMetaData.getString( "TABLE_NAME");
+        String col = columnMetaData.getString( "COLUMN_NAME");
+
+        String sql = "SELECT geometry_type FROM geometry_columns " +
+                "WHERE f_table_name = Lower('" + tbl + "') " +
+                "AND f_geometry_column = Lower('" + col + "')";
+        LOGGER.fine( sql );
+
+        Statement st = cx.createStatement();
+        try {
+            ResultSet rs = st.executeQuery( sql );
+            try {
+                if ( rs.next() ) {
+                    int type = rs.getInt(1);
+                    Geometries geometryType = getGeometryByType(type);
+                    return (geometryType == null) ? null : geometryType.getBinding();
+                }
+            }
+            finally {
+                dataStore.closeSafe( rs );
+            }
+
+            // check geometry columns views
+            sql = "SELECT b.geometry_type FROM views_geometry_columns a, geometry_columns b " +
+                    "WHERE a.f_table_name = b.f_table_name " +
+                    "AND a.f_geometry_column = b.f_geometry_column " +
+                    "AND a.view_name = Lower('" + tbl + "') " +
+                    "AND a.view_geometry = Lower('" + col + "')";
+            LOGGER.fine( sql );
+            try {
+                rs = st.executeQuery(sql);
+                try {
+                    if (rs.next()) {
+                        int type = rs.getInt(1);
+                        Geometries geometryType = getGeometryByType(type);
+                        return (geometryType == null) ? null : geometryType.getBinding();
+                    }
+                }
+                finally {
+                    dataStore.closeSafe(rs);
+                }
+            }
+            catch(SQLException e) {
+                LOGGER.log(Level.FINEST, "error querying views_geometry_columns", e);
+            }
+        }
+        finally {
+            dataStore.closeSafe( st );
+        }
+
+        return null;
+    }
+
+    private Geometries getGeometryByType(int geometryType) {
+        geometryType = geometryType % 1000; // There are 1000-multiplier prefix for different coordinate dimensions.
+
+        switch (geometryType) {
+            case 0:
+                return Geometries.GEOMETRY;
+            case 1:
+                return Geometries.POINT;
+            case 2:
+                return Geometries.LINESTRING;
+            case 3:
+                return Geometries.POLYGON;
+            case 4:
+                return Geometries.MULTIPOINT;
+            case 5:
+                return Geometries.MULTILINESTRING;
+            case 6:
+                return Geometries.MULTIPOLYGON;
+            case 7:
+                return Geometries.GEOMETRYCOLLECTION;
+            default:
+                LOGGER.log(Level.WARNING, "Unsupported geometry type: {}", geometryType);
+        }
+
+        return null;
     }
 }
